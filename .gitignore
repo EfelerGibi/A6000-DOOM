@@ -1,0 +1,37 @@
+# --- toolchain: ~4 GB of NDK, build-tools, JDK, vendored clones
+toolchain/
+
+# --- doomgeneric is cloned by setup.sh, not vendored
+jni/doomgeneric/
+
+# --- build output
+build/
+libs/
+obj/
+*.apk
+*.ap_
+*.dex
+*.class
+*.o
+*.so
+
+# --- signing key. Keep a backup OUTSIDE the repo: releases signed with a
+# different key can't upgrade over an installed copy.
+*.keystore
+*.jks
+
+# --- IWADs are never redistributed with the app
+*.wad
+*.WAD
+
+# --- logs pulled off the camera
+DOOMLOG.TXT
+DOOMOUT.TXT
+*.log
+
+# --- editors / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
