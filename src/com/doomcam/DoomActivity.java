@@ -11,30 +11,37 @@ import android.graphics.Rect;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
+import android.os.SystemClock;
 import android.util.Log;
 import android.util.SparseArray;
+import android.view.Display;
+import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.Window;
 import android.view.WindowManager;
+import android.widget.FrameLayout;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public class DoomActivity extends Activity implements SurfaceHolder.Callback, Runnable {
 
     private static final String TAG = "doomcam";
 
     // Must match DOOMGENERIC_RESX/RESY in Android.mk. Doom renders at its
-    // native 320x200; Canvas scales 2x into 640x400 on the 640x480 panel,
-    // leaving a 40 px letterbox top and bottom.
+    // native 320x200; the native side scales it by the largest integer that
+    // fits the display (2x -> 640x400 on the a6000's 640x480 panel).
     private static final int W = 320, H = 200;
-    private static final int DRAW_W = 640, DRAW_H = 400;
 
     // The app's private /data area on PMCA cameras is tiny, so the IWAD is
     // never copied -- it is read in place from the card, and Doom's config and
@@ -48,8 +55,16 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
 
     private native void nativeCreate(String iwadPath, String workDir);
     private native void nativeTick();
-    private native void nativeBlit(Bitmap bmp);
     private native void nativeKey(int pressed, int doomKey);
+    private native void nativeSetMailbox(int on);
+    private native void nativeStop();
+    private native void nativeGetStats(long[] out);
+    private native void nativeAddPresentStats(long lockUs, long drawUs, long postUs);
+    private native int  nativePresentBitmap(Bitmap bmp, int timeoutMs);
+    private native int  nativeAttachSurface(Surface surface);
+    private native void nativeDetachSurface();
+    private native int  nativePresentWindow(int timeoutMs);
+    private native String nativeWindowInfo();
 
     // ---- Doom key codes (doomkeys.h)
     private static final int K_RIGHT = 0xae, K_LEFT = 0xac, K_UP = 0xad, K_DOWN = 0xaf;
@@ -74,18 +89,36 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
 
     private SurfaceView view;
     private SurfaceHolder holder;
-    private Bitmap frame;
-    private Thread loop;
+    private Bitmap frame;               // Canvas path only
+    private Thread loop, presenter;
     private volatile boolean running;
-    private final Rect src = new Rect(0, 0, DRAW_W, DRAW_H);
+    private int drawW = 2 * W, drawH = 2 * H;
+    private final Rect src = new Rect();
     private final Paint paint = new Paint();
     private final Rect dst = new Rect();
+
+    // Everything that touches the Surface happens under surfaceLock, so the
+    // UI thread never tears it down mid-present.
+    private final Object surfaceLock = new Object();
+    private boolean surfaceOk;          // guarded by surfaceLock
+    private boolean needAttach;         // guarded by surfaceLock
+    private boolean useNative;          // guarded by surfaceLock
+    private int nativeFails;            // guarded by surfaceLock
+    private boolean loggedWindow;       // guarded by surfaceLock
+    // >0 while a SurfaceHolder callback wants surfaceLock. The presenter
+    // re-takes the lock right after releasing it, so it backs off while this
+    // is set instead of relying on the monitor being fair.
+    private volatile int uiWaiting;     // written by the UI thread only
+
+    // doomcam.ini (see writeDefaultConfig)
+    private boolean cfgNative = true, cfgThreaded = true, cfgMailbox = true, cfgPriority = true;
 
     private final Handler handler = new Handler();
     private final SparseArray<Runnable> pendingRelease = new SparseArray<Runnable>();
     private int weapon = 1;
 
     private File logFile;
+    private final Object logLock = new Object();
     private boolean exiting = false;
     private volatile int clearFrames = 8;   // SurfaceView rotates 2-3 buffers
 
@@ -95,6 +128,19 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN
                            | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+
+        // Size the SurfaceView to exactly the scaled frame (640x400 on the
+        // a6000) instead of the whole panel: SurfaceFlinger then composites
+        // 17% fewer pixels per frame and there is no letterbox to clear.
+        Display d = getWindowManager().getDefaultDisplay();
+        int sw = d.getWidth(), sh = d.getHeight();
+        if (sw <= 0 || sh <= 0) { sw = 640; sh = 480; }
+        int scale = Math.max(1, Math.min(sw / W, sh / H));
+        drawW = W * scale;
+        drawH = H * scale;
+
+        FrameLayout root = new FrameLayout(this);
+        root.setBackgroundColor(Color.BLACK);
         view = new SurfaceView(this);
         holder = view.getHolder();
         holder.addCallback(this);
@@ -102,13 +148,17 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
         // bitmap into a 565 surface makes Canvas convert AND dither every
         // pixel in software -- that alone cost ~99 ms per frame.
         holder.setFormat(PixelFormat.RGB_565);
-        setContentView(view);
-        // Doom renders 320x200; the C blit expands 2x into this bitmap so
-        // Canvas has nothing to scale.
-        frame = Bitmap.createBitmap(DRAW_W, DRAW_H, Bitmap.Config.RGB_565);
+        root.addView(view, new FrameLayout.LayoutParams(drawW, drawH, Gravity.CENTER));
+        setContentView(root);
+
+        // Canvas fallback: the C side expands 2x into this bitmap so Canvas
+        // has nothing to scale.
+        frame = Bitmap.createBitmap(drawW, drawH, Bitmap.Config.RGB_565);
+        src.set(0, 0, drawW, drawH);
         paint.setDither(false);
         paint.setFilterBitmap(false);
         paint.setAntiAlias(false);
+        Log.i(TAG, "display " + sw + "x" + sh + " -> surface " + drawW + "x" + drawH);
     }
 
     @Override
@@ -151,13 +201,15 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
 
     private void log(String msg) {
         Log.i(TAG, msg);
-        if (logFile == null) return;
-        try {
-            FileWriter w = new FileWriter(logFile, true);
-            w.write(msg);
-            w.write("\n");
-            w.close();
-        } catch (Throwable ignored) { }
+        synchronized (logLock) {
+            if (logFile == null) return;
+            try {
+                FileWriter w = new FileWriter(logFile, true);
+                w.write(msg);
+                w.write("\n");
+                w.close();
+            } catch (Throwable ignored) { }
+        }
     }
 
     private void log(String msg, Throwable t) {
@@ -170,21 +222,43 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
     // ------------------------------------------------------------ lifecycle
 
     public void surfaceCreated(SurfaceHolder h) {
+        uiWaiting++;
+        synchronized (surfaceLock) {
+            surfaceOk = true;
+            needAttach = true;
+            surfaceLock.notifyAll();
+        }
+        uiWaiting--;
         if (loop == null) { running = true; loop = new Thread(this, "doom"); loop.start(); }
     }
 
     public void surfaceChanged(SurfaceHolder h, int fmt, int w, int hh) {
-        int x = (w - DRAW_W) / 2, y = (hh - DRAW_H) / 2;
-        dst.set(Math.max(0, x), Math.max(0, y), Math.max(0, x) + DRAW_W, Math.max(0, y) + DRAW_H);
-        clearFrames = 8;
+        uiWaiting++;
+        synchronized (surfaceLock) {
+            int x = (w - drawW) / 2, y = (hh - drawH) / 2;
+            dst.set(Math.max(0, x), Math.max(0, y), Math.max(0, x) + drawW, Math.max(0, y) + drawH);
+            clearFrames = 8;
+            needAttach = true;      // the native Surface behind it may have been replaced
+        }
+        uiWaiting--;
         Log.i(TAG, "surface " + w + "x" + hh + " fmt=" + fmt + " -> dst " + dst);
     }
 
-    public void surfaceDestroyed(SurfaceHolder h) { }
+    public void surfaceDestroyed(SurfaceHolder h) {
+        // Blocks until the presenter is outside nativePresentWindow / lockCanvas.
+        uiWaiting++;
+        synchronized (surfaceLock) {
+            surfaceOk = false;
+            useNative = false;
+            nativeDetachSurface();
+        }
+        uiWaiting--;
+    }
 
     @Override
     protected void onDestroy() {
         running = false;
+        nativeStop();
         super.onDestroy();
         // Doom has no clean shutdown and cannot be re-initialised in the same
         // process, so on a real exit we let the process go.
@@ -253,6 +327,73 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
         return null;
     }
 
+    // --------------------------------------------------------------- config
+    // <card>/doomcam/doomcam.ini, so rendering modes can be compared on the
+    // camera without rebuilding. Written with defaults on first run.
+
+    private void loadConfig(File work) {
+        File f = new File(work, "doomcam.ini");
+        if (!f.exists()) {
+            writeDefaultConfig(f);
+        } else {
+            try {
+                BufferedReader r = new BufferedReader(new FileReader(f));
+                String line;
+                while ((line = r.readLine()) != null) {
+                    int c = line.indexOf('#');
+                    if (c >= 0) line = line.substring(0, c);
+                    int eq = line.indexOf('=');
+                    if (eq < 0) continue;
+                    String k = line.substring(0, eq).trim().toLowerCase();
+                    String v = line.substring(eq + 1).trim().toLowerCase();
+                    if (k.equals("present"))       cfgNative   = !v.equals("canvas");
+                    else if (k.equals("threads"))  cfgThreaded = !v.equals("1");
+                    else if (k.equals("sync"))     cfgMailbox  = !v.equals("fifo");
+                    else if (k.equals("priority")) cfgPriority = !v.equals("0");
+                }
+                r.close();
+            } catch (Throwable t) { log("reading " + f + " failed", t); }
+        }
+        log("config: present=" + (cfgNative ? "native" : "canvas")
+            + " threads=" + (cfgThreaded ? 2 : 1)
+            + " sync=" + (cfgMailbox ? "mailbox" : "fifo")
+            + " priority=" + (cfgPriority ? 1 : 0));
+    }
+
+    private void writeDefaultConfig(File f) {
+        try {
+            FileWriter w = new FileWriter(f);
+            w.write("# DoomCam settings. Edit in Mass Storage mode; read when the app starts.\n"
+                  + "#\n"
+                  + "# present = native | canvas\n"
+                  + "#   native: write frames straight into the screen buffer (fastest).\n"
+                  + "#   canvas: go through a Bitmap and Canvas.drawBitmap. Used automatically\n"
+                  + "#   if native is unavailable on this firmware.\n"
+                  + "present = native\n"
+                  + "#\n"
+                  + "# threads = 2 | 1\n"
+                  + "#   2: Doom renders the next frame while the screen waits for the last one.\n"
+                  + "#   1: old single-threaded loop (render, then wait, then render ...).\n"
+                  + "threads = 2\n"
+                  + "#\n"
+                  + "# sync = mailbox | fifo\n"
+                  + "#   mailbox: the newest frame always wins (lowest input lag).\n"
+                  + "#   fifo: Doom waits until the screen took its frame (less CPU).\n"
+                  + "sync = mailbox\n"
+                  + "#\n"
+                  + "# priority = 1 | 0   raise the scheduling priority of the render threads\n"
+                  + "priority = 1\n");
+            w.close();
+        } catch (Throwable t) { log("writing " + f + " failed", t); }
+    }
+
+    private void raisePriority(int prio, String who) {
+        if (!cfgPriority) return;
+        try {
+            android.os.Process.setThreadPriority(prio);
+        } catch (Throwable t) { log(who + ": setThreadPriority(" + prio + ") failed: " + t); }
+    }
+
     // ---------------------------------------------------------- render loop
 
     public void run() {
@@ -278,63 +419,170 @@ public class DoomActivity extends Activity implements SurfaceHolder.Callback, Ru
             File work = new File(card, "doomcam");
             if (!work.exists() && !work.mkdirs()) log("WARN: could not create " + work);
             log("workdir: " + work.getAbsolutePath());
+            log("surface: " + drawW + "x" + drawH);
+
+            loadConfig(work);
+            // Single-threaded, fifo would deadlock: the screen melt publishes
+            // several frames inside one tick, with nobody else to take them.
+            if (!cfgThreaded && !cfgMailbox) { cfgMailbox = true; log("threads=1: using sync=mailbox"); }
+            nativeSetMailbox(cfgMailbox ? 1 : 0);
+            raisePriority(android.os.Process.THREAD_PRIORITY_DISPLAY, "doom");
 
             nativeCreate(wad.getAbsolutePath(), work.getAbsolutePath());
             log("doom initialised, entering loop");
 
-            long frames = 0, t0 = System.currentTimeMillis();
-            long tTick = 0, tBlit = 0, tLock = 0, tDraw = 0, tPost = 0;
-            while (running) {
-                long a = System.currentTimeMillis();
-                nativeTick();
-                long b = System.currentTimeMillis();
-                nativeBlit(frame);
-                long c0 = System.currentTimeMillis();
-                Canvas c = holder.lockCanvas();
-                long d = System.currentTimeMillis();
-                if (c != null) {
-                    // Clear enough frames to cover every buffer in the
-                    // rotation, or stale garbage shows in the letterbox bands.
-                    if (clearFrames > 0) { c.drawColor(Color.BLACK); clearFrames--; }
-                    c.drawBitmap(frame, src, dst, paint);
-                    long e = System.currentTimeMillis();
-                    holder.unlockCanvasAndPost(c);
-                    tDraw += e - d;
-                    tPost += System.currentTimeMillis() - e;
-                }
-                tTick += b - a;
-                tBlit += c0 - b;
-                tLock += d - c0;
-                if (++frames % 300 == 0) {
-                    long now = System.currentTimeMillis();
-                    log("fps ~" + (300000L / Math.max(1, now - t0))
-                        + "  per-frame ms: tick=" + (tTick / 300)
-                        + " blit=" + (tBlit / 300)
-                        + " lock=" + (tLock / 300)
-                        + " draw=" + (tDraw / 300)
-                        + " post=" + (tPost / 300));
-                    t0 = now;
-                    tTick = tBlit = tLock = tDraw = tPost = 0;
+            if (cfgThreaded) {
+                presenter = new Thread(new Runnable() {
+                    public void run() { presentLoop(); }
+                }, "present");
+                presenter.start();
+                while (running) nativeTick();
+            } else {
+                long lastLog = SystemClock.uptimeMillis();
+                while (running) {
+                    nativeTick();
+                    if (presentOnce(0) < 0) SystemClock.sleep(5);
+                    lastLog = maybeLogStats(lastLog);
                 }
             }
         } catch (Throwable t) {
             log("loop died", t);
+            stopPresenter();
             try { fail("Crashed:\n" + t); } catch (Throwable ignored) { }
         }
     }
 
+    private void presentLoop() {
+        try {
+            raisePriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY, "present");
+            long lastLog = SystemClock.uptimeMillis();
+            while (running) {
+                // 100 ms: during level loads Doom produces nothing; re-show
+                // the last frame now and then rather than hold a buffer forever.
+                if (presentOnce(100) < 0) SystemClock.sleep(5);
+                lastLog = maybeLogStats(lastLog);
+            }
+        } catch (Throwable t) {
+            log("present loop died", t);
+        }
+    }
+
+    private void stopPresenter() {
+        running = false;
+        nativeStop();
+        Thread p = presenter;
+        if (p != null) {
+            try { p.join(1000); } catch (InterruptedException ignored) { }
+        }
+    }
+
+    /** One frame to the screen. 1 = new frame, 0 = old frame / no surface, -1 = error. */
+    private int presentOnce(int timeoutMs) {
+        if (uiWaiting > 0) { SystemClock.sleep(2); return 0; }
+        synchronized (surfaceLock) {
+            if (!surfaceOk) {
+                try { surfaceLock.wait(100); } catch (InterruptedException ignored) { }
+                return 0;
+            }
+            if (needAttach) {
+                needAttach = false;
+                nativeFails = 0;
+                useNative = cfgNative && nativeAttachSurface(holder.getSurface()) == 1;
+                log("present path: " + (useNative ? "native (ANativeWindow)" : "canvas")
+                    + (cfgNative && !useNative ? " -- native unavailable, see logcat" : ""));
+            }
+            if (useNative) {
+                int r = nativePresentWindow(timeoutMs);
+                if (r >= 0) {
+                    nativeFails = 0;
+                    if (!loggedWindow) { loggedWindow = true; log("window buffer: " + nativeWindowInfo()); }
+                    return r;
+                }
+                if (++nativeFails >= 10) {
+                    log("native present failed 10x in a row (" + nativeWindowInfo()
+                        + "), falling back to canvas");
+                    useNative = false;
+                    nativeDetachSurface();
+                }
+                return -1;
+            }
+            return presentCanvas(timeoutMs);
+        }
+    }
+
+    private int presentCanvas(int timeoutMs) {
+        long t0 = System.nanoTime();
+        Canvas c = holder.lockCanvas();
+        long t1 = System.nanoTime();
+        if (c == null) return -1;
+        int got;
+        long t2, t3;
+        try {
+            got = nativePresentBitmap(frame, timeoutMs);
+            t2 = System.nanoTime();
+            // Clear enough frames to cover every buffer in the rotation, or
+            // stale garbage shows in any letterbox band.
+            if (clearFrames > 0) { c.drawColor(Color.BLACK); clearFrames--; }
+            c.drawBitmap(frame, src, dst, paint);
+        } finally {
+            t3 = System.nanoTime();
+            holder.unlockCanvasAndPost(c);
+        }
+        long t4 = System.nanoTime();
+        nativeAddPresentStats((t1 - t0) / 1000, (t3 - t2) / 1000, (t4 - t3) / 1000);
+        return got < 0 ? -1 : got;
+    }
+
+    // ---------------------------------------------------------------- stats
+
+    private final long[] st = new long[13];
+
+    private static String ms(long us, long n) {
+        if (n <= 0) return "-";
+        return String.format(Locale.US, "%.1f", us / 1000.0 / n);
+    }
+
+    private static String rate(long n, long dtMs) {
+        return String.format(Locale.US, "%.1f", n * 1000.0 / Math.max(1, dtMs));
+    }
+
+    /** Every 5 s: what each thread spent its time on, per frame. */
+    private long maybeLogStats(long last) {
+        long now = SystemClock.uptimeMillis();
+        long dt = now - last;
+        if (dt < 5000) return last;
+        nativeGetStats(st);
+        long ticks = st[0], produced = st[1], dropped = st[2], presented = st[3], repeats = st[4];
+        long iters = presented + repeats;
+        boolean nat;
+        synchronized (surfaceLock) { nat = useNative; }
+        log("fps " + rate(presented, dt)
+            + " (doom " + rate(produced, dt) + ", dropped " + rate(dropped, dt)
+            + ", repeats " + rate(repeats, dt) + ")"
+            + " | doom ms/tick: wall=" + ms(st[5], ticks) + " cpu=" + ms(st[6], ticks)
+            + " convert=" + ms(st[7], produced) + " handoff=" + ms(st[8], produced)
+            + " | present ms: lock=" + ms(st[9], iters) + " wait=" + ms(st[10], iters)
+            + " copy=" + ms(st[11], iters) + " post=" + ms(st[12], iters)
+            + " | " + (nat ? "native" : "canvas") + " threads=" + (cfgThreaded ? 2 : 1)
+            + " " + (cfgMailbox ? "mailbox" : "fifo"));
+        return now;
+    }
+
     /** Readable message on the camera screen instead of a black rectangle. */
     private void fail(String msg) {
-        Canvas c = holder.lockCanvas();
-        if (c == null) return;
-        Paint p = new Paint();
-        p.setColor(Color.WHITE);
-        p.setTextSize(20);
-        p.setAntiAlias(true);
-        c.drawColor(Color.BLACK);
-        String[] lines = msg.split("\n");
-        for (int i = 0; i < lines.length; i++) c.drawText(lines[i], 20, 60 + i * 26, p);
-        holder.unlockCanvasAndPost(c);
+        synchronized (surfaceLock) {
+            if (!surfaceOk) return;
+            Canvas c = holder.lockCanvas();
+            if (c == null) return;
+            Paint p = new Paint();
+            p.setColor(Color.WHITE);
+            p.setTextSize(20);
+            p.setAntiAlias(true);
+            c.drawColor(Color.BLACK);
+            String[] lines = msg.split("\n");
+            for (int i = 0; i < lines.length; i++) c.drawText(lines[i], 20, 60 + i * 26, p);
+            holder.unlockCanvasAndPost(c);
+        }
     }
 
     // ---------------------------------------------------------------- input

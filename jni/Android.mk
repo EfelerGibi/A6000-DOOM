@@ -19,15 +19,18 @@ DG_SRC := \
   st_stuff.c s_sound.c tables.c v_video.c wi_stuff.c w_checksum.c w_file.c \
   w_main.c w_wad.c z_zone.c w_file_stdc.c i_input.c i_video.c doomgeneric.c
 
-LOCAL_SRC_FILES := doomgeneric_camera.c $(addprefix $(DG)/, $(DG_SRC))
+LOCAL_SRC_FILES := doomgeneric_camera.c dc_core.c $(addprefix $(DG)/, $(DG_SRC))
 LOCAL_C_INCLUDES := $(LOCAL_PATH)/$(DG)
 
-# Render at Doom's native 320x200 and let Canvas do the 2x scale during the
-# blit. doomgeneric's default 640x400 makes the C side software-scale every
-# frame, then we swizzle and upload 4x the pixels.
+# Render at Doom's native 320x200; dc_core.c does the 2x while writing the
+# surface. CMAP256 makes doomgeneric hand over 8-bit palette indices instead
+# of converting every pixel to 32-bit itself (cmap_to_fb), which we would
+# only convert again to RGB565.
 LOCAL_CFLAGS  := -DNORMALUNIX -DLINUX -DDOOMGENERIC_RESX=320 -DDOOMGENERIC_RESY=200 \
-                 -O2 -ffast-math -fomit-frame-pointer -w
+                 -DCMAP256 -O2 -ffast-math -fomit-frame-pointer -w
 LOCAL_ARM_MODE := arm
-LOCAL_LDLIBS  := -llog -ljnigraphics -lm
+# -ldl: libandroid.so (ANativeWindow) is dlopen()ed, not linked, so firmware
+# without it still loads the app and falls back to the Canvas path.
+LOCAL_LDLIBS  := -llog -ljnigraphics -lm -ldl
 
 include $(BUILD_SHARED_LIBRARY)

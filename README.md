@@ -3,7 +3,9 @@
 Doom running on a Sony α6000, as a PlayMemories Camera App.
 
 Renders at Doom's native 320×200, scaled 2× onto the camera's 640×480 panel with
-a 40 px letterbox. Around 26 fps, which is display-paced rather than CPU-bound.
+a 40 px letterbox. The first release ran at about 26 fps with a single-threaded
+loop; the current code renders and displays on separate threads, aiming for
+30–35 fps (Doom's own game clock tops out at 35). See *Performance notes*.
 The controls are mapped to the camera body: wheel to turn, d-pad to strafe,
 shutter to fire.
 
@@ -138,10 +140,15 @@ suitable one.
 Six stages: `ndk-build` → `aapt` → `javac` → `d8` → repackage → `zipalign` +
 `apksigner`.
 
+`tools/hosttest/run.sh <iwad>` checks the frame path on a desktop, with no NDK
+or camera: it plays DEMO1 through the current code and through the previous
+release's conversion and requires byte-identical RGB565 frames, then runs the
+render/display threads under ThreadSanitizer. Needs `gcc` and `python3`.
+
 ### Debugging
 
-`<card>/DOOMLOG.TXT` holds the app's log — card path, WAD found, per-frame
-timings, stack traces. `<card>/doomcam/DOOMOUT.TXT` holds Doom's own stdout and
+`<card>/DOOMLOG.TXT` holds the app's log — card path, WAD found, the settings
+in use, per-frame timings every 5 seconds, stack traces. `<card>/doomcam/DOOMOUT.TXT` holds Doom's own stdout and
 stderr, including any `I_Error` before it exits. Both survive the app dying,
 which matters because adb goes away when you leave Tweak.
 
@@ -169,7 +176,8 @@ left commented in the source for anyone who wants to experiment. Use AEL.
 without the patch. Freedoom Phase 1 has four episodes, so Doom identifies it as
 *The Ultimate DOOM* and tries to draw an episode-4 menu graphic Freedoom doesn't
 ship — doomgeneric's own comment concedes it "should crash if missing".
-`setup.sh` applies this, but if you re-clone `jni/doomgeneric/` by hand:
+`setup.sh` applies this (and pins doomgeneric to a known commit), but if you
+re-clone `jni/doomgeneric/` by hand:
 
 ```bash
 sed -i 's|    if (gameversion < exe_ultimate)|    if (gameversion < exe_ultimate \|\| W_CheckNumForName("M_EPI4") < 0)|' \
@@ -198,8 +206,68 @@ dither* every pixel in software. Three changes took `draw` from 99 ms to 2 ms:
 - a `Paint` with dither, filter and anti-alias off
 - the 2× scale moved into the JNI blit, so `drawBitmap` is a 1:1 copy
 
-The profile is now `tick=11 blit=4 lock=17 draw=2`. `lock` is `lockCanvas`
-waiting on the display, so the panel sets the ceiling at roughly 30 fps.
+The profile was then `tick=11 blit=4 lock=17 draw=2`, about 26 fps.
+
+### Getting past 26 fps
+
+That profile is a single thread doing everything in sequence, so a frame cost
+the *sum* of the stages, ~38 ms. `lock` (waiting for SurfaceFlinger to free a
+buffer) was 17 ms of pure waiting that Doom could have spent on the next frame.
+The current code attacks both the sequencing and the work:
+
+- **Two threads.** The `doom` thread only runs ticks. The `present` thread
+  waits for a free surface buffer, takes the newest finished frame and posts it.
+  Frames are handed over through a three-slot buffer in `jni/dc_core.c`, so a
+  frame now costs `max(tick, present)` instead of `tick + present`.
+- **No duplicate renders.** doomgeneric's `TryRunTics()` returns without running
+  a tic if it's entered before the next one is due, and `D_Display()` then
+  renders an identical frame anyway. As soon as ticks are faster than 28.6 ms
+  that doubles the render work (desktop: 62 renders/s for 35 tics/s).
+  `dc_tick()` waits for the tic first.
+- **One pixel conversion instead of two.** Built with `-DCMAP256`, doomgeneric
+  hands over 8-bit palette indices; the presenter turns them into RGB565 and
+  doubles them in one pass, writing 32-bit words. Previously doomgeneric's
+  `cmap_to_fb` converted every pixel to 32-bit, then `nativeBlit` converted it
+  again to 565. About 6–8× less work for this step.
+- **No Bitmap or Canvas.** The presenter writes straight into the SurfaceView's
+  buffer through `ANativeWindow` (Android 2.3+). `libandroid.so` is `dlopen`ed,
+  so if a firmware lacks it the app falls back to the Bitmap + `drawBitmap`
+  path by itself.
+- **A 640×400 surface** instead of the whole 640×480 panel: 17% less for
+  SurfaceFlinger to composite each frame, and no letterbox to clear.
+- **Higher thread priority** for the two render threads.
+- The screen-melt wipe is now actually shown: `DG_DrawFrame` publishes every
+  frame Doom draws, including the ones inside the wipe loop.
+
+None of this has been measured on the camera yet. Every 5 seconds DOOMLOG.TXT
+gets a line like this:
+
+```
+fps 30.1 (doom 35.0, dropped 4.9, repeats 0.0) | doom ms/tick: wall=7.9 cpu=7.4 convert=0.2 handoff=0.0 | present ms: lock=21.0 wait=1.5 copy=1.2 post=0.6 | native threads=2 mailbox
+```
+
+- `fps` is frames that reached the screen; `doom` is frames Doom rendered (35
+  is its ceiling). `dropped` frames were replaced by a newer one before the
+  display could take them.
+- `doom ms/tick`: `cpu` is the Doom thread's own CPU time. If `wall` is well
+  above `cpu`, something else is taking the CPU (SurfaceFlinger, if the
+  camera exposes only one core to Android).
+- `present ms`: `lock` is the wait for a free surface buffer — the display's
+  pace. If `fps` stays under 30 while `lock` dominates, the limit is
+  SurfaceFlinger, not Doom.
+
+### doomcam.ini
+
+`<card>/doomcam/doomcam.ini` is written with defaults on first run and read at
+every start, so the variants can be compared on the camera without rebuilding.
+Edit it in Mass Storage mode.
+
+| Key | Values | Default | |
+| --- | --- | --- | --- |
+| `present` | `native`, `canvas` | `native` | write straight into the surface, or go through Bitmap + Canvas |
+| `threads` | `2`, `1` | `2` | `1` is the old single-threaded loop, for comparison |
+| `sync` | `mailbox`, `fifo` | `mailbox` | `mailbox`: newest frame wins (least lag). `fifo`: Doom waits for the display (less CPU) |
+| `priority` | `1`, `0` | `1` | raise the render threads' scheduling priority |
 
 Other things that cost time:
 

@@ -36,10 +36,20 @@ fetch https://raw.githubusercontent.com/Sable/android-platforms/master/android-2
       "$TC/platform/android.jar"
 
 # ---- 4. doomgeneric sources, straight into jni/ so ndk-build sees them
+# Pinned: dc_core.c reads doomgeneric's CMAP256 internals (colors[],
+# palette_changed), so an unreviewed upstream change could break the build.
+DG_COMMIT=e257a09527062bfb986b6e5e0780839b6cbd5b71
 if [ ! -d jni/doomgeneric ]; then
-  echo ">> cloning doomgeneric"
-  git clone --depth 1 https://github.com/ozkl/doomgeneric.git "$TC/doomgeneric-src"
+  echo ">> fetching doomgeneric @ ${DG_COMMIT:0:7}"
+  rm -rf "$TC/doomgeneric-src"
+  git init -q "$TC/doomgeneric-src"
+  git -C "$TC/doomgeneric-src" fetch -q --depth 1 https://github.com/ozkl/doomgeneric.git "$DG_COMMIT"
+  git -C "$TC/doomgeneric-src" checkout -q FETCH_HEAD
   cp -r "$TC/doomgeneric-src/doomgeneric" jni/doomgeneric
+  # Freedoom Phase 1 has four episodes but no M_EPI4 menu graphic; without
+  # this Doom aborts with "W_GetNumForName: M_EPI4 not found!".
+  sed -i 's|    if (gameversion < exe_ultimate)|    if (gameversion < exe_ultimate \|\| W_CheckNumForName("M_EPI4") < 0)|' \
+      jni/doomgeneric/m_menu.c
 fi
 
 # ---- 5. Sony-PMCA-RE + its python venv
